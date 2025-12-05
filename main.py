@@ -80,6 +80,17 @@ class AlistClient:
                     logger.error("未能从 Alist API 响应中获取令牌。")
                     return
                 self.headers["Authorization"] = self.token
+                # If an httpx client already exists, update its headers so subsequent requests use new token
+                if self._client and not getattr(self._client, 'is_closed', True):
+                    try:
+                        self._client.headers["Authorization"] = self.token
+                    except Exception:
+                        # If updating headers is not possible, close the client so it is recreated with new headers
+                        try:
+                            await self._client.aclose()
+                        except Exception:
+                            pass
+                        self._client = None
             except httpx.HTTPStatusError as e:
                 logger.error(f"身份验证失败，状态码: {e.response.status_code}, 响应: {e.response.text}")
                 return
@@ -124,7 +135,52 @@ class AlistClient:
                 if data.get("code") == 200:
                     return data.get("data") if "data" in data else data
                 else:
-                    logger.error(f"Alist API error ({path}): Code {data.get('code')} - {data.get('message', 'Unknown error')}. Response: {data}")
+                    # Special-case: if token invalidated AND credentials exist, attempt to re-auth and retry once
+                    code = data.get('code')
+                    message_text = data.get('message', '')
+                    logger.error(f"Alist API error ({path}): Code {code} - {message_text}. Response: {data}")
+                    if code == 401 or 'token is invalid' in str(message_text).lower() or 'token is invalidated' in str(message_text).lower():
+                        # If username/password configured, try to re-authenticate and retry once
+                        if self.username and self.password:
+                            logger.info("Token appears invalidated; attempting to re-authenticate and retry request.")
+                            # Clear local token so authenticate() will set a fresh one
+                            old_token = self.token
+                            await self.authenticate()
+                            # If authenticate succeeded and token changed, update client headers
+                            if self._client and not self._client.is_closed:
+                                try:
+                                    # Update authorization header for existing httpx client
+                                    self._client.headers["Authorization"] = self.token
+                                except Exception:
+                                    # If updating headers isn't supported, close and recreate client on next get_client
+                                    try:
+                                        await self._client.aclose()
+                                    except Exception:
+                                        pass
+                                    self._client = None
+
+                            # If token changed, retry the request once
+                            if self.token and self.token != old_token:
+                                client = await self.get_client()
+                                try:
+                                    logger.debug("Retrying API request after re-authentication.")
+                                    response = await client.request(method, url, **kwargs)
+                                    response.raise_for_status()
+                                    data = response.json()
+                                    logger.debug(f"Alist API Response Data (retry) (type: {type(data)}): {data}")
+                                    if isinstance(data, dict) and "code" in data and data.get('code') == 200:
+                                        return data.get('data') if "data" in data else data
+                                    else:
+                                        logger.error(f"Retry after re-auth returned error for ({path}): {data}")
+                                        return None
+                                except Exception as retry_e:
+                                    logger.error(f"Error retrying API call after re-auth: {retry_e}", exc_info=True)
+                                    return None
+                            else:
+                                logger.error("Re-authentication did not produce a new token; cannot retry request.")
+                                return None
+                        else:
+                            logger.error("Token invalidated but no username/password configured to re-authenticate.")
                     return None
             elif isinstance(data, list) and response.status_code == 200:
                  logger.debug(f"Alist API ({path}) returned a list directly, assuming success.")
@@ -137,6 +193,39 @@ class AlistClient:
                  return None
         except httpx.HTTPStatusError as e:
             logger.error(f"Alist API HTTP Status Error ({path}): {e.response.status_code}. Response: {e.response.text}")
+            # If status is 401, attempt to re-authenticate once when username/password are available
+            if e.response is not None and e.response.status_code == 401 and self.username and self.password:
+                try:
+                    logger.info("HTTP 401 received; attempting to re-authenticate and retry API call.")
+                    old_token = self.token
+                    await self.authenticate()
+                    if self._client and not getattr(self._client, 'is_closed', True):
+                        try:
+                            self._client.headers["Authorization"] = self.token
+                        except Exception:
+                            try:
+                                await self._client.aclose()
+                            except Exception:
+                                pass
+                            self._client = None
+                    if self.token and self.token != old_token:
+                        client = await self.get_client()
+                        try:
+                            response = await client.request(method, url, **kwargs)
+                            response.raise_for_status()
+                            data = response.json()
+                            logger.debug(f"Alist API Response Data (retry) (type: {type(data)}): {data}")
+                            if isinstance(data, dict) and "code" in data and data.get('code') == 200:
+                                return data.get('data') if "data" in data else data
+                            else:
+                                logger.error(f"Retry after re-auth returned error for ({path}): {data}")
+                                return None
+                        except Exception as retry_e:
+                            logger.error(f"Error retrying API call after re-auth (HTTP 401): {retry_e}", exc_info=True)
+                            return None
+                except Exception:
+                    # Ignore and proceed to general HTTPStatusError handling below
+                    pass
             if e.response.status_code == 500:
                  try:
                      error_data = e.response.json()
@@ -409,6 +498,32 @@ class AlistPlugin(Star):
                 elif username and password:
                     self.alist_client = AlistClient(host=host, username=username, password=password, timeout=timeout)
                     await self.alist_client.authenticate()
+                    # Optionally persist token back to plugin config if supported
+                    new_token = self.alist_client.token
+                    if new_token:
+                        # Try common config persistence APIs safely
+                        if hasattr(self.config, 'set') and callable(getattr(self.config, 'set')):
+                            try:
+                                self.config.set('alist_token', new_token)
+                                logger.info("Persisted refreshed alist_token to plugin config (via config.set).")
+                                if hasattr(self.config, 'save') and callable(getattr(self.config, 'save')):
+                                    try:
+                                        self.config.save()
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                logger.debug("Failed to persist token via config.set/save; falling through to other methods.")
+                        elif isinstance(self.config, dict):
+                            self.config['alist_token'] = new_token
+                            logger.info("Persisted refreshed alist_token to plugin config (dict-like).")
+                        else:
+                            try:
+                                # Fallback: attempt item assignment
+                                self.config['alist_token'] = new_token
+                                logger.info("Persisted refreshed alist_token to plugin config (fallback __setitem__).")
+                            except Exception:
+                                logger.debug("Could not persist token to plugin config using available methods; continuing without persistence.")
+                    # Any exceptions during token persistence are handled per-method; continue without failing init.
                 else:
                     logger.error("Alist token 或用户名/密码未配置，无法初始化客户端。")
                     self.alist_client = None
